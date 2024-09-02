@@ -232,6 +232,7 @@
   V(_, deleteProperty_string, "deleteProperty")                               \
   V(_, detached_string, "detached")                                           \
   V(_, disjunction_string, "disjunction")                                     \
+  V(_, disposed_string, "disposed")                                           \
   V(_, done_string, "done")                                                   \
   V(_, dot_brand_string, ".brand")                                            \
   V(_, dot_catch_string, ".catch")                                            \
@@ -403,6 +404,7 @@
   V(_, roundingIncrement_string, "roundingIncrement")                         \
   V(_, RuntimeError_string, "RuntimeError")                                   \
   V(_, WebAssemblyException_string, "WebAssembly.Exception")                  \
+  V(_, WebAssemblyModule_string, "WebAssembly.Module")                        \
   V(_, Script_string, "Script")                                               \
   V(_, script_string, "script")                                               \
   V(_, second_string, "second")                                               \
@@ -487,8 +489,6 @@
   V(_, uninitialized_symbol)                          \
   V(_, megamorphic_symbol)                            \
   V(_, elements_transition_symbol)                    \
-  V(_, clone_object_ic_transition_symbol)             \
-  V(_, object_assign_clone_transition_symbol)         \
   V(_, mega_dom_symbol)
 
 #define NOT_IMPORTANT_PRIVATE_SYMBOL_LIST_GENERATOR(V, _) \

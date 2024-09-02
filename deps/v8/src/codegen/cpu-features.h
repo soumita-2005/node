@@ -22,6 +22,7 @@ enum CpuFeature {
   AVX,
   AVX2,
   AVX_VNNI,
+  AVX_VNNI_INT8,
   FMA3,
   BMI1,
   BMI2,
@@ -66,7 +67,7 @@ enum CpuFeature {
 #elif V8_TARGET_ARCH_LOONG64
   FPU,
 
-#elif V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+#elif V8_TARGET_ARCH_PPC64
   PPC_6_PLUS,
   PPC_7_PLUS,
   PPC_8_PLUS,
@@ -90,6 +91,7 @@ enum CpuFeature {
   ZBA,
   ZBB,
   ZBS,
+  ZICOND,
 #endif
 
   NUMBER_OF_CPU_FEATURES

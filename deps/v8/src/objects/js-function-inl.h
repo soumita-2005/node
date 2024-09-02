@@ -5,6 +5,8 @@
 #ifndef V8_OBJECTS_JS_FUNCTION_INL_H_
 #define V8_OBJECTS_JS_FUNCTION_INL_H_
 
+#include <optional>
+
 #include "src/objects/js-function.h"
 
 // Include other inline headers *after* including js-function.h, such that e.g.
@@ -18,12 +20,12 @@
 #include "src/objects/instance-type-inl.h"
 #include "src/objects/map-updater.h"
 #include "src/objects/shared-function-info-inl.h"
+#include "src/sandbox/js-dispatch-table-inl.h"
 
 // Has to be the last include (doesn't have include guards):
 #include "src/objects/object-macros.h"
 
-namespace v8 {
-namespace internal {
+namespace v8::internal {
 
 #include "torque-generated/src/objects/js-function-tq-inl.inc"
 
@@ -75,32 +77,130 @@ Tagged<AbstractCode> JSFunction::abstract_code(IsolateT* isolate) {
 
 int JSFunction::length() { return shared()->length(); }
 
-Tagged<Code> JSFunction::code(IsolateForSandbox isolate) const {
-  return ReadCodePointerField(kCodeOffset, isolate);
+void JSFunction::UpdateMaybeContextSpecializedCode(Isolate* isolate,
+                                                   Tagged<Code> value,
+                                                   WriteBarrierMode mode) {
+  if (value->is_context_specialized()) {
+    UpdateContextSpecializedCode(isolate, value, mode);
+  } else {
+    UpdateCode(value, mode);
+  }
 }
 
-void JSFunction::set_code(Tagged<Code> value, WriteBarrierMode mode) {
+void JSFunction::UpdateContextSpecializedCode(Isolate* isolate,
+                                              Tagged<Code> value,
+                                              WriteBarrierMode mode) {
+  DisallowGarbageCollection no_gc;
+  DCHECK(value->is_context_specialized());
+
+#ifdef V8_ENABLE_LEAPTIERING
+  JSDispatchHandle handle = dispatch_handle();
+  JSDispatchHandle canonical_handle = raw_feedback_cell()->dispatch_handle();
+  auto jdt = GetProcessWideJSDispatchTable();
+  bool has_context_specialized_dispatch_entry = handle != canonical_handle;
+  // For specialized code we allocate their own dispatch entry, which is
+  // different from the one in the dispatch cell.
+  // TODO(olivf): In case we have a NoClosuresFeedbackCell we could steal the
+  // existing dispatch entry and install a yet to be implemented shared lazy
+  // updating dispatch entry on the feedback cell.
+  DCHECK_NE(canonical_handle, kNullJSDispatchHandle);
+  DCHECK(value->is_context_specialized());
+  DCHECK(value->is_optimized_code());
+  DCHECK(jdt->HasCode(canonical_handle));
+  if (has_context_specialized_dispatch_entry) {
+    jdt->SetCode(handle, value);
+    CONDITIONAL_JS_DISPATCH_HANDLE_WRITE_BARRIER(*this, handle, mode);
+  } else {
+    JSDispatchHandle specialized_handle = jdt->AllocateAndInitializeEntry(
+        isolate->heap()->js_dispatch_table_space(), value->parameter_count(),
+        value, value->instruction_start());
+    set_dispatch_handle(specialized_handle);
+    CONDITIONAL_JS_DISPATCH_HANDLE_WRITE_BARRIER(*this, specialized_handle,
+                                                 mode);
+  }
+#else
   WriteCodePointerField(kCodeOffset, value);
   CONDITIONAL_CODE_POINTER_WRITE_BARRIER(*this, kCodeOffset, value, mode);
-}
-
-Tagged<Code> JSFunction::code(IsolateForSandbox isolate,
-                              AcquireLoadTag tag) const {
-  return ReadCodePointerField(kCodeOffset, isolate);
-}
-
-void JSFunction::set_code(Tagged<Code> value, ReleaseStoreTag,
-                          WriteBarrierMode mode) {
-  WriteCodePointerField(kCodeOffset, value);
-  CONDITIONAL_CODE_POINTER_WRITE_BARRIER(*this, kCodeOffset, value, mode);
+#endif  // V8_ENABLE_LEAPTIERING
 
   if (V8_UNLIKELY(v8_flags.log_function_events && has_feedback_vector())) {
     feedback_vector()->set_log_next_execution(true);
   }
 }
 
+void JSFunction::UpdateCode(Tagged<Code> value, WriteBarrierMode mode) {
+  DisallowGarbageCollection no_gc;
+  DCHECK(!value->is_context_specialized());
+
+#ifdef V8_ENABLE_LEAPTIERING
+  JSDispatchHandle canonical_handle = raw_feedback_cell()->dispatch_handle();
+  auto jdt = GetProcessWideJSDispatchTable();
+
+#ifdef DEBUG
+  bool has_context_specialized_dispatch_entry =
+      canonical_handle != kNullJSDispatchHandle &&
+      dispatch_handle() != canonical_handle;
+  if (has_context_specialized_dispatch_entry) {
+    DCHECK_IMPLIES(
+        jdt->HasCode(dispatch_handle()) &&
+            jdt->GetCode(dispatch_handle())->kind() != CodeKind::BUILTIN,
+        jdt->GetCode(dispatch_handle())->is_context_specialized());
+  }
+  DCHECK_NE(dispatch_handle(), kNullJSDispatchHandle);
+#endif  // DEBUG
+
+  if (canonical_handle != kNullJSDispatchHandle) {
+    // Ensure we are using the canonical dispatch handle (needed in case this
+    // function was specialized before).
+    jdt->SetCode(canonical_handle, value);
+    set_dispatch_handle(canonical_handle);
+    CONDITIONAL_JS_DISPATCH_HANDLE_WRITE_BARRIER(*this, canonical_handle, mode);
+  } else {
+    JSDispatchHandle handle = dispatch_handle();
+    jdt->SetCode(handle, value);
+    CONDITIONAL_JS_DISPATCH_HANDLE_WRITE_BARRIER(*this, handle, mode);
+  }
+#else
+  WriteCodePointerField(kCodeOffset, value);
+  CONDITIONAL_CODE_POINTER_WRITE_BARRIER(*this, kCodeOffset, value, mode);
+#endif  // V8_ENABLE_LEAPTIERING
+
+  if (V8_UNLIKELY(v8_flags.log_function_events && has_feedback_vector())) {
+    feedback_vector()->set_log_next_execution(true);
+  }
+}
+
+Tagged<Code> JSFunction::code(IsolateForSandbox isolate) const {
+#ifdef V8_ENABLE_LEAPTIERING
+  return GetProcessWideJSDispatchTable()->GetCode(dispatch_handle());
+#else
+  return ReadCodePointerField(kCodeOffset, isolate);
+#endif
+}
+
+Tagged<Code> JSFunction::code(IsolateForSandbox isolate,
+                              AcquireLoadTag tag) const {
+#ifdef V8_ENABLE_LEAPTIERING
+  return GetProcessWideJSDispatchTable()->GetCode(dispatch_handle(tag));
+#else
+  return ReadCodePointerField(kCodeOffset, isolate);
+#endif
+}
+
 Tagged<Object> JSFunction::raw_code(IsolateForSandbox isolate) const {
-#ifdef V8_ENABLE_SANDBOX
+#if V8_ENABLE_LEAPTIERING
+  JSDispatchTable* jdt = GetProcessWideJSDispatchTable();
+  JSDispatchHandle handle = dispatch_handle();
+  // TODO(saelo): consieder adding a MaybeGetCode method instead.
+  if (!jdt->HasCode(handle)) {
+    // This is invoked on background threads so we could see a JSFunction here
+    // that currently switches to a new dispatch table entry (e.g. due to
+    // context specialization). In that case, the table entry may not be fully
+    // initialized yet.
+    return Smi::zero();
+  }
+  return jdt->GetCode(handle);
+#elif V8_ENABLE_SANDBOX
   return RawIndirectPointerField(kCodeOffset, kCodeIndirectPointerTag)
       .Relaxed_Load(isolate);
 #else
@@ -110,13 +210,54 @@ Tagged<Object> JSFunction::raw_code(IsolateForSandbox isolate) const {
 
 Tagged<Object> JSFunction::raw_code(IsolateForSandbox isolate,
                                     AcquireLoadTag tag) const {
-#ifdef V8_ENABLE_SANDBOX
+#if V8_ENABLE_LEAPTIERING
+  JSDispatchTable* jdt = GetProcessWideJSDispatchTable();
+  JSDispatchHandle handle = dispatch_handle(tag);
+  // TODO(saelo): consider adding a MaybeGetCode method instead.
+  if (!jdt->HasCode(handle)) {
+    // This is invoked on background threads so we could see a JSFunction here
+    // that currently switches to a new dispatch table entry (e.g. due to
+    // context specialization). In that case, the table entry may not be fully
+    // initialized yet.
+    return Smi::zero();
+  }
+  return jdt->GetCode(handle);
+#elif V8_ENABLE_SANDBOX
   return RawIndirectPointerField(kCodeOffset, kCodeIndirectPointerTag)
       .Acquire_Load(isolate);
 #else
   return ACQUIRE_READ_FIELD(*this, JSFunction::kCodeOffset);
 #endif  // V8_ENABLE_SANDBOX
 }
+
+#ifdef V8_ENABLE_LEAPTIERING
+void JSFunction::initialize_dispatch_handle(IsolateForSandbox isolate,
+                                            uint16_t parameter_count) {
+  InitJSDispatchHandleField(kDispatchHandleOffset, isolate, parameter_count);
+}
+
+void JSFunction::initialize_dispatch_handle(IsolateForSandbox isolate,
+                                            uint16_t parameter_count,
+                                            Tagged<Code> code,
+                                            Address entrypoint) {
+  InitJSDispatchHandleField(kDispatchHandleOffset, isolate, parameter_count,
+                            code, entrypoint);
+}
+
+void JSFunction::clear_dispatch_handle() {
+  WriteField<JSDispatchHandle>(kDispatchHandleOffset, kNullJSDispatchHandle);
+}
+void JSFunction::set_dispatch_handle(JSDispatchHandle handle) {
+  Relaxed_WriteField<JSDispatchHandle>(kDispatchHandleOffset, handle);
+}
+JSDispatchHandle JSFunction::dispatch_handle() const {
+  return Relaxed_ReadField<JSDispatchHandle>(kDispatchHandleOffset);
+}
+
+JSDispatchHandle JSFunction::dispatch_handle(AcquireLoadTag tag) const {
+  return Acquire_ReadField<JSDispatchHandle>(kDispatchHandleOffset);
+}
+#endif  // V8_ENABLE_LEAPTIERING
 
 RELEASE_ACQUIRE_ACCESSORS(JSFunction, context, Tagged<Context>, kContextOffset)
 
@@ -287,9 +428,9 @@ bool JSFunction::NeedsResetDueToFlushedBaselineCode(IsolateForSandbox isolate) {
 }
 
 void JSFunction::ResetIfCodeFlushed(
-    IsolateForSandbox isolate,
-    base::Optional<std::function<void(
-        Tagged<HeapObject> object, ObjectSlot slot, Tagged<HeapObject> target)>>
+    Isolate* isolate,
+    std::optional<std::function<void(Tagged<HeapObject> object, ObjectSlot slot,
+                                     Tagged<HeapObject> target)>>
         gc_notify_updated_slot) {
   const bool kBytecodeCanFlush =
       v8_flags.flush_bytecode || v8_flags.stress_snapshot;
@@ -301,7 +442,7 @@ void JSFunction::ResetIfCodeFlushed(
   if (kBytecodeCanFlush && NeedsResetDueToFlushedBytecode(isolate)) {
     // Bytecode was flushed and function is now uncompiled, reset JSFunction
     // by setting code to CompileLazy and clearing the feedback vector.
-    set_code(*BUILTIN_CODE(GetIsolate(), CompileLazy));
+    UpdateCode(*BUILTIN_CODE(isolate, CompileLazy));
     raw_feedback_cell()->reset_feedback_vector(gc_notify_updated_slot);
     return;
   }
@@ -310,12 +451,11 @@ void JSFunction::ResetIfCodeFlushed(
                  kBaselineCodeCanFlush);
   if (kBaselineCodeCanFlush && NeedsResetDueToFlushedBaselineCode(isolate)) {
     // Flush baseline code from the closure if required
-    set_code(*BUILTIN_CODE(GetIsolate(), InterpreterEntryTrampoline));
+    UpdateCode(*BUILTIN_CODE(isolate, InterpreterEntryTrampoline));
   }
 }
 
-}  // namespace internal
-}  // namespace v8
+}  // namespace v8::internal
 
 #include "src/objects/object-macros-undef.h"
 

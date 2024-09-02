@@ -190,6 +190,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <initializer_list>
 #include <iterator>
 #include <limits>
@@ -210,9 +211,11 @@
 #include "absl/container/internal/common.h"  // IWYU pragma: export // for node_handle
 #include "absl/container/internal/compressed_tuple.h"
 #include "absl/container/internal/container_memory.h"
+#include "absl/container/internal/hash_function_defaults.h"
 #include "absl/container/internal/hash_policy_traits.h"
 #include "absl/container/internal/hashtable_debug_hooks.h"
 #include "absl/container/internal/hashtablez_sampler.h"
+#include "absl/hash/hash.h"
 #include "absl/memory/memory.h"
 #include "absl/meta/type_traits.h"
 #include "absl/numeric/bits.h"
@@ -535,6 +538,14 @@ static_assert(ctrl_t::kDeleted == static_cast<ctrl_t>(-2),
 
 // See definition comment for why this is size 32.
 ABSL_DLL extern const ctrl_t kEmptyGroup[32];
+
+// We use these sentinel capacity values in debug mode to indicate different
+// classes of bugs.
+enum InvalidCapacity : size_t {
+  kAboveMaxValidCapacity = ~size_t{} - 100,
+  kReentrance,
+  kDestroyed,
+};
 
 // Returns a pointer to a control byte group that can be used by empty tables.
 inline ctrl_t* EmptyGroup() {
@@ -1376,7 +1387,8 @@ class CommonFields : public CommonFieldsGenerationInfo {
   // The total number of available slots.
   size_t capacity() const { return capacity_; }
   void set_capacity(size_t c) {
-    assert(c == 0 || IsValidCapacity(c));
+    // We allow setting above the max valid capacity for debugging purposes.
+    assert(c == 0 || IsValidCapacity(c) || c > kAboveMaxValidCapacity);
     capacity_ = c;
   }
 
@@ -1442,6 +1454,20 @@ class CommonFields : public CommonFieldsGenerationInfo {
   size_t TombstonesCount() const {
     return static_cast<size_t>(
         std::count(control(), control() + capacity(), ctrl_t::kDeleted));
+  }
+
+  // Helper to enable sanitizer mode validation to protect against reentrant
+  // calls during element constructor/destructor.
+  template <typename F>
+  void RunWithReentrancyGuard(F f) {
+#ifdef NDEBUG
+    f();
+    return;
+#endif
+    const size_t cap = capacity();
+    set_capacity(InvalidCapacity::kReentrance);
+    f();
+    set_capacity(cap);
   }
 
  private:
@@ -2835,7 +2861,12 @@ class raw_hash_set {
         typename AllocTraits::propagate_on_container_move_assignment());
   }
 
-  ~raw_hash_set() { destructor_impl(); }
+  ~raw_hash_set() {
+    destructor_impl();
+#ifndef NDEBUG
+    common().set_capacity(InvalidCapacity::kDestroyed);
+#endif
+  }
 
   iterator begin() ABSL_ATTRIBUTE_LIFETIME_BOUND {
     if (ABSL_PREDICT_FALSE(empty())) return end();
@@ -2874,6 +2905,7 @@ class raw_hash_set {
   size_t max_size() const { return (std::numeric_limits<size_t>::max)(); }
 
   ABSL_ATTRIBUTE_REINITIALIZES void clear() {
+    AssertNotDebugCapacity();
     // Iterating over this container is O(bucket_count()). When bucket_count()
     // is much greater than size(), iteration becomes prohibitively expensive.
     // For clear() it is more important to reuse the allocated array when the
@@ -3127,6 +3159,7 @@ class raw_hash_set {
   // This overload is necessary because otherwise erase<K>(const K&) would be
   // a better match if non-const iterator is passed as an argument.
   void erase(iterator it) {
+    AssertNotDebugCapacity();
     AssertIsFull(it.control(), it.generation(), it.generation_ptr(), "erase()");
     destroy(it.slot());
     if (is_soo()) {
@@ -3138,6 +3171,7 @@ class raw_hash_set {
 
   iterator erase(const_iterator first,
                  const_iterator last) ABSL_ATTRIBUTE_LIFETIME_BOUND {
+    AssertNotDebugCapacity();
     // We check for empty first because ClearBackingArray requires that
     // capacity() > 0 as a precondition.
     if (empty()) return end();
@@ -3193,6 +3227,7 @@ class raw_hash_set {
   }
 
   node_type extract(const_iterator position) {
+    AssertNotDebugCapacity();
     AssertIsFull(position.control(), position.inner_.generation(),
                  position.inner_.generation_ptr(), "extract()");
     auto node = CommonAccess::Transfer<node_type>(alloc_ref(), position.slot());
@@ -3325,13 +3360,13 @@ class raw_hash_set {
   template <class K = key_type>
   iterator find(const key_arg<K>& key,
                 size_t hash) ABSL_ATTRIBUTE_LIFETIME_BOUND {
-    AssertHashEqConsistent(key);
+    AssertOnFind(key);
     if (is_soo()) return find_soo(key);
     return find_non_soo(key, hash);
   }
   template <class K = key_type>
   iterator find(const key_arg<K>& key) ABSL_ATTRIBUTE_LIFETIME_BOUND {
-    AssertHashEqConsistent(key);
+    AssertOnFind(key);
     if (is_soo()) return find_soo(key);
     prefetch_heap_block();
     return find_non_soo(key, hash_ref()(key));
@@ -3476,16 +3511,19 @@ class raw_hash_set {
     slot_type&& slot;
   };
 
-  // TODO(b/303305702): re-enable reentrant validation.
   template <typename... Args>
   inline void construct(slot_type* slot, Args&&... args) {
-    PolicyTraits::construct(&alloc_ref(), slot, std::forward<Args>(args)...);
+    common().RunWithReentrancyGuard([&] {
+      PolicyTraits::construct(&alloc_ref(), slot, std::forward<Args>(args)...);
+    });
   }
   inline void destroy(slot_type* slot) {
-    PolicyTraits::destroy(&alloc_ref(), slot);
+    common().RunWithReentrancyGuard(
+        [&] { PolicyTraits::destroy(&alloc_ref(), slot); });
   }
   inline void transfer(slot_type* to, slot_type* from) {
-    PolicyTraits::transfer(&alloc_ref(), to, from);
+    common().RunWithReentrancyGuard(
+        [&] { PolicyTraits::transfer(&alloc_ref(), to, from); });
   }
 
   // TODO(b/289225379): consider having a helper class that has the impls for
@@ -3690,15 +3728,18 @@ class raw_hash_set {
   static slot_type* to_slot(void* buf) { return static_cast<slot_type*>(buf); }
 
   // Requires that lhs does not have a full SOO slot.
-  static void move_common(bool that_is_full_soo, allocator_type& rhs_alloc,
+  static void move_common(bool rhs_is_full_soo, allocator_type& rhs_alloc,
                           CommonFields& lhs, CommonFields&& rhs) {
-    if (PolicyTraits::transfer_uses_memcpy() || !that_is_full_soo) {
+    if (PolicyTraits::transfer_uses_memcpy() || !rhs_is_full_soo) {
       lhs = std::move(rhs);
     } else {
       lhs.move_non_heap_or_soo_fields(rhs);
-      // TODO(b/303305702): add reentrancy guard.
-      PolicyTraits::transfer(&rhs_alloc, to_slot(lhs.soo_data()),
-                             to_slot(rhs.soo_data()));
+      rhs.RunWithReentrancyGuard([&] {
+        lhs.RunWithReentrancyGuard([&] {
+          PolicyTraits::transfer(&rhs_alloc, to_slot(lhs.soo_data()),
+                                 to_slot(rhs.soo_data()));
+        });
+      });
     }
   }
 
@@ -3831,11 +3872,40 @@ class raw_hash_set {
   }
 
  protected:
+  // Asserts for correctness that we run on find/find_or_prepare_insert.
+  template <class K>
+  void AssertOnFind(ABSL_ATTRIBUTE_UNUSED const K& key) {
+#ifdef NDEBUG
+    return;
+#endif
+    AssertHashEqConsistent(key);
+    AssertNotDebugCapacity();
+  }
+
+  // Asserts that the capacity is not a sentinel invalid value.
+  // TODO(b/296061262): also add asserts for moved-from state.
+  void AssertNotDebugCapacity() const {
+    assert(capacity() != InvalidCapacity::kReentrance &&
+           "reentrant container access during element construction/destruction "
+           "is not allowed.");
+    assert(capacity() != InvalidCapacity::kDestroyed &&
+           "use of destroyed hash table.");
+  }
+
   // Asserts that hash and equal functors provided by the user are consistent,
   // meaning that `eq(k1, k2)` implies `hash(k1)==hash(k2)`.
   template <class K>
-  void AssertHashEqConsistent(ABSL_ATTRIBUTE_UNUSED const K& key) {
-#ifndef NDEBUG
+  void AssertHashEqConsistent(const K& key) {
+    // If the hash/eq functors are known to be consistent, then skip validation.
+    if (std::is_same<hasher, absl::container_internal::StringHash>::value &&
+        std::is_same<key_equal, absl::container_internal::StringEq>::value) {
+      return;
+    }
+    if (std::is_scalar<key_type>::value &&
+        std::is_same<hasher, absl::Hash<key_type>>::value &&
+        std::is_same<key_equal, std::equal_to<key_type>>::value) {
+      return;
+    }
     if (empty()) return;
 
     const size_t hash_of_arg = hash_ref()(key);
@@ -3847,21 +3917,8 @@ class raw_hash_set {
 
       const size_t hash_of_slot =
           PolicyTraits::apply(HashElement{hash_ref()}, element);
-      const bool is_hash_equal = hash_of_arg == hash_of_slot;
-      if (!is_hash_equal) {
-        // In this case, we're going to crash. Do a couple of other checks for
-        // idempotence issues. Recalculating hash/eq here is also convenient for
-        // debugging with gdb/lldb.
-        const size_t once_more_hash_arg = hash_ref()(key);
-        assert(hash_of_arg == once_more_hash_arg && "hash is not idempotent.");
-        const size_t once_more_hash_slot =
-            PolicyTraits::apply(HashElement{hash_ref()}, element);
-        assert(hash_of_slot == once_more_hash_slot &&
-               "hash is not idempotent.");
-        const bool once_more_eq =
-            PolicyTraits::apply(EqualElement<K>{key, eq_ref()}, element);
-        assert(is_key_equal == once_more_eq && "equality is not idempotent.");
-      }
+      ABSL_ATTRIBUTE_UNUSED const bool is_hash_equal =
+          hash_of_arg == hash_of_slot;
       assert((!is_key_equal || is_hash_equal) &&
              "eq(k1, k2) must imply that hash(k1) == hash(k2). "
              "hash/eq functors are inconsistent.");
@@ -3874,7 +3931,6 @@ class raw_hash_set {
     // We only do validation for small tables so that it's constant time.
     if (capacity() > 16) return;
     IterateOverFullSlots(common(), slot_array(), assert_consistent);
-#endif
   }
 
   // Attempts to find `key` in the table; if it isn't found, returns an iterator
@@ -3882,7 +3938,7 @@ class raw_hash_set {
   // `key`'s H2. Returns a bool indicating whether an insertion can take place.
   template <class K>
   std::pair<iterator, bool> find_or_prepare_insert(const K& key) {
-    AssertHashEqConsistent(key);
+    AssertOnFind(key);
     if (is_soo()) return find_or_prepare_insert_soo(key);
     return find_or_prepare_insert_non_soo(key);
   }

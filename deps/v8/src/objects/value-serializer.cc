@@ -262,7 +262,7 @@ enum class ArrayBufferViewTag : uint8_t {
 
 // Sub-tags only meaningful for error serialization.
 enum class ErrorTag : uint8_t {
-  // The error is a EvalError. No accompanying data.
+  // The error is an EvalError. No accompanying data.
   kEvalErrorPrototype = 'E',
   // The error is a RangeError. No accompanying data.
   kRangeErrorPrototype = 'R',
@@ -2239,7 +2239,7 @@ MaybeHandle<Object> ValueDeserializer::ReadJSError() {
   }
 
   // Check for message property.
-  Handle<Object> message = isolate_->factory()->undefined_value();
+  DirectHandle<Object> message = isolate_->factory()->undefined_value();
   if (static_cast<ErrorTag>(tag) == ErrorTag::kMessage) {
     Handle<String> message_string;
     if (!ReadString().ToHandle(&message_string)) {

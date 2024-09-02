@@ -5,7 +5,9 @@
 #include <assert.h>  // For assert
 #include <limits.h>  // For LONG_MIN, LONG_MAX.
 
-#if V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+#if V8_TARGET_ARCH_PPC64
+
+#include <optional>
 
 #include "src/base/bits.h"
 #include "src/base/division-by-constant.h"
@@ -868,11 +870,12 @@ void MacroAssembler::JumpIfJSAnyIsNotPrimitive(Register heap_object,
 #ifdef DEBUG
     Label ok;
     LoadMap(scratch, heap_object);
-    CompareInstanceTypeRange(scratch, scratch, FIRST_JS_RECEIVER_TYPE,
+    CompareInstanceTypeRange(scratch, scratch, r0, FIRST_JS_RECEIVER_TYPE,
                              LAST_JS_RECEIVER_TYPE);
     ble(&ok);
     LoadMap(scratch, heap_object);
-    CompareInstanceTypeRange(scratch, scratch, FIRST_PRIMITIVE_HEAP_OBJECT_TYPE,
+    CompareInstanceTypeRange(scratch, scratch, r0,
+                             FIRST_PRIMITIVE_HEAP_OBJECT_TYPE,
                              LAST_PRIMITIVE_HEAP_OBJECT_TYPE);
     ble(&ok);
     Abort(AbortReason::kInvalidReceiver);
@@ -1286,7 +1289,6 @@ void MacroAssembler::ConvertUnsignedIntToFloat(Register src,
   fcfids(dst, dst);
 }
 
-#if V8_TARGET_ARCH_PPC64
 void MacroAssembler::ConvertInt64ToDouble(Register src,
                                           DoubleRegister double_dst) {
   MovInt64ToDouble(double_dst, src);
@@ -1310,12 +1312,8 @@ void MacroAssembler::ConvertInt64ToFloat(Register src,
   MovInt64ToDouble(double_dst, src);
   fcfids(double_dst, double_dst);
 }
-#endif
 
 void MacroAssembler::ConvertDoubleToInt64(const DoubleRegister double_input,
-#if !V8_TARGET_ARCH_PPC64
-                                          const Register dst_hi,
-#endif
                                           const Register dst,
                                           const DoubleRegister double_dst,
                                           FPRoundingMode rounding_mode) {
@@ -1328,13 +1326,9 @@ void MacroAssembler::ConvertDoubleToInt64(const DoubleRegister double_input,
   }
 
   MovDoubleToInt64(
-#if !V8_TARGET_ARCH_PPC64
-      dst_hi,
-#endif
       dst, double_dst);
 }
 
-#if V8_TARGET_ARCH_PPC64
 void MacroAssembler::ConvertDoubleToUnsignedInt64(
     const DoubleRegister double_input, const Register dst,
     const DoubleRegister double_dst, FPRoundingMode rounding_mode) {
@@ -1348,149 +1342,6 @@ void MacroAssembler::ConvertDoubleToUnsignedInt64(
 
   MovDoubleToInt64(dst, double_dst);
 }
-#endif
-
-#if !V8_TARGET_ARCH_PPC64
-void MacroAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
-                                   Register src_low, Register src_high,
-                                   Register scratch, Register shift) {
-  DCHECK(!AreAliased(dst_low, src_high));
-  DCHECK(!AreAliased(dst_high, src_low));
-  DCHECK(!AreAliased(dst_low, dst_high, shift));
-  Label less_than_32;
-  Label done;
-  cmpi(shift, Operand(32));
-  blt(&less_than_32);
-  // If shift >= 32
-  andi(scratch, shift, Operand(0x1F));
-  ShiftLeftU32(dst_high, src_low, scratch);
-  li(dst_low, Operand::Zero());
-  b(&done);
-  bind(&less_than_32);
-  // If shift < 32
-  subfic(scratch, shift, Operand(32));
-  ShiftLeftU32(dst_high, src_high, shift);
-  srw(scratch, src_low, scratch);
-  orx(dst_high, dst_high, scratch);
-  ShiftLeftU32(dst_low, src_low, shift);
-  bind(&done);
-}
-
-void MacroAssembler::ShiftLeftPair(Register dst_low, Register dst_high,
-                                   Register src_low, Register src_high,
-                                   uint32_t shift) {
-  DCHECK(!AreAliased(dst_low, src_high));
-  DCHECK(!AreAliased(dst_high, src_low));
-  if (shift == 32) {
-    Move(dst_high, src_low);
-    li(dst_low, Operand::Zero());
-  } else if (shift > 32) {
-    shift &= 0x1F;
-    ShiftLeftU32(dst_high, src_low, Operand(shift));
-    li(dst_low, Operand::Zero());
-  } else if (shift == 0) {
-    Move(dst_low, src_low);
-    Move(dst_high, src_high);
-  } else {
-    ShiftLeftU32(dst_high, src_high, Operand(shift));
-    rlwimi(dst_high, src_low, shift, 32 - shift, 31);
-    ShiftLeftU32(dst_low, src_low, Operand(shift));
-  }
-}
-
-void MacroAssembler::ShiftRightPair(Register dst_low, Register dst_high,
-                                    Register src_low, Register src_high,
-                                    Register scratch, Register shift) {
-  DCHECK(!AreAliased(dst_low, src_high));
-  DCHECK(!AreAliased(dst_high, src_low));
-  DCHECK(!AreAliased(dst_low, dst_high, shift));
-  Label less_than_32;
-  Label done;
-  cmpi(shift, Operand(32));
-  blt(&less_than_32);
-  // If shift >= 32
-  andi(scratch, shift, Operand(0x1F));
-  srw(dst_low, src_high, scratch);
-  li(dst_high, Operand::Zero());
-  b(&done);
-  bind(&less_than_32);
-  // If shift < 32
-  subfic(scratch, shift, Operand(32));
-  srw(dst_low, src_low, shift);
-  ShiftLeftU32(scratch, src_high, scratch);
-  orx(dst_low, dst_low, scratch);
-  srw(dst_high, src_high, shift);
-  bind(&done);
-}
-
-void MacroAssembler::ShiftRightPair(Register dst_low, Register dst_high,
-                                    Register src_low, Register src_high,
-                                    uint32_t shift) {
-  DCHECK(!AreAliased(dst_low, src_high));
-  DCHECK(!AreAliased(dst_high, src_low));
-  if (shift == 32) {
-    Move(dst_low, src_high);
-    li(dst_high, Operand::Zero());
-  } else if (shift > 32) {
-    shift &= 0x1F;
-    srwi(dst_low, src_high, Operand(shift));
-    li(dst_high, Operand::Zero());
-  } else if (shift == 0) {
-    Move(dst_low, src_low);
-    Move(dst_high, src_high);
-  } else {
-    srwi(dst_low, src_low, Operand(shift));
-    rlwimi(dst_low, src_high, 32 - shift, 0, shift - 1);
-    srwi(dst_high, src_high, Operand(shift));
-  }
-}
-
-void MacroAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
-                                       Register src_low, Register src_high,
-                                       Register scratch, Register shift) {
-  DCHECK(!AreAliased(dst_low, src_high, shift));
-  DCHECK(!AreAliased(dst_high, src_low, shift));
-  Label less_than_32;
-  Label done;
-  cmpi(shift, Operand(32));
-  blt(&less_than_32);
-  // If shift >= 32
-  andi(scratch, shift, Operand(0x1F));
-  sraw(dst_low, src_high, scratch);
-  srawi(dst_high, src_high, 31);
-  b(&done);
-  bind(&less_than_32);
-  // If shift < 32
-  subfic(scratch, shift, Operand(32));
-  srw(dst_low, src_low, shift);
-  ShiftLeftU32(scratch, src_high, scratch);
-  orx(dst_low, dst_low, scratch);
-  sraw(dst_high, src_high, shift);
-  bind(&done);
-}
-
-void MacroAssembler::ShiftRightAlgPair(Register dst_low, Register dst_high,
-                                       Register src_low, Register src_high,
-                                       uint32_t shift) {
-  DCHECK(!AreAliased(dst_low, src_high));
-  DCHECK(!AreAliased(dst_high, src_low));
-  if (shift == 32) {
-    Move(dst_low, src_high);
-    srawi(dst_high, src_high, 31);
-  } else if (shift > 32) {
-    shift &= 0x1F;
-    srawi(dst_low, src_high, shift);
-    srawi(dst_high, src_high, 31);
-  } else if (shift == 0) {
-    Move(dst_low, src_low);
-    Move(dst_high, src_high);
-  } else {
-    srwi(dst_low, src_low, Operand(shift));
-    rlwimi(dst_low, src_high, 32 - shift, 0, shift - 1);
-    srawi(dst_high, src_high, shift);
-  }
-}
-#endif
 
 void MacroAssembler::LoadConstantPoolPointerRegisterFromCodeTargetAddress(
     Register code_target_address, Register scratch1, Register scratch2) {
@@ -1593,7 +1444,7 @@ void MacroAssembler::EnterFrame(StackFrame::Type type,
     PushCommonFrame(scratch);
   }
 #if V8_ENABLE_WEBASSEMBLY
-  if (type == StackFrame::WASM) Push(kWasmInstanceRegister);
+  if (type == StackFrame::WASM) Push(kWasmImplicitArgRegister);
 #endif  // V8_ENABLE_WEBASSEMBLY
 }
 
@@ -1991,7 +1842,7 @@ void MacroAssembler::PopStackHandler() {
 #if V8_STATIC_ROOTS_BOOL
 void MacroAssembler::CompareInstanceTypeWithUniqueCompressedMap(
     Register map, Register scratch, InstanceType type) {
-  base::Optional<RootIndex> expected =
+  std::optional<RootIndex> expected =
       InstanceTypeChecker::UniqueMapOfInstanceType(type);
   CHECK(expected);
   Tagged_t expected_ptr = ReadOnlyRootPtr(*expected);
@@ -2046,6 +1897,15 @@ void MacroAssembler::CompareObjectType(Register object, Register map,
   CompareInstanceType(map, temp, type);
 }
 
+void MacroAssembler::CompareObjectTypeRange(Register object, Register map,
+                                            Register type_reg, Register scratch,
+                                            InstanceType lower_limit,
+                                            InstanceType upper_limit) {
+  ASM_CODE_COMMENT(this);
+  LoadMap(map, object);
+  CompareInstanceTypeRange(map, type_reg, scratch, lower_limit, upper_limit);
+}
+
 void MacroAssembler::CompareInstanceType(Register map, Register type_reg,
                                          InstanceType type) {
   static_assert(Map::kInstanceTypeOffset < 4096);
@@ -2054,12 +1914,10 @@ void MacroAssembler::CompareInstanceType(Register map, Register type_reg,
   cmpi(type_reg, Operand(type));
 }
 
-void MacroAssembler::CompareRange(Register value, unsigned lower_limit,
-                                  unsigned higher_limit) {
+void MacroAssembler::CompareRange(Register value, Register scratch,
+                                  unsigned lower_limit, unsigned higher_limit) {
   ASM_CODE_COMMENT(this);
   DCHECK_LT(lower_limit, higher_limit);
-  UseScratchRegisterScope temps(this);
-  Register scratch = temps.Acquire();
   if (lower_limit != 0) {
     mov(scratch, Operand(lower_limit));
     sub(scratch, value, scratch);
@@ -2071,11 +1929,12 @@ void MacroAssembler::CompareRange(Register value, unsigned lower_limit,
 }
 
 void MacroAssembler::CompareInstanceTypeRange(Register map, Register type_reg,
+                                              Register scratch,
                                               InstanceType lower_limit,
                                               InstanceType higher_limit) {
   DCHECK_LT(lower_limit, higher_limit);
   LoadU16(type_reg, FieldMemOperand(map, Map::kInstanceTypeOffset));
-  CompareRange(type_reg, lower_limit, higher_limit);
+  CompareRange(type_reg, scratch, lower_limit, higher_limit);
 }
 
 void MacroAssembler::CompareTaggedRoot(const Register& obj, RootIndex index) {
@@ -2288,10 +2147,11 @@ void MacroAssembler::MaxF64(DoubleRegister dst, DoubleRegister lhs,
   bind(&done);
 }
 
-void MacroAssembler::JumpIfIsInRange(Register value, unsigned lower_limit,
+void MacroAssembler::JumpIfIsInRange(Register value, Register scratch,
+                                     unsigned lower_limit,
                                      unsigned higher_limit,
                                      Label* on_in_range) {
-  CompareRange(value, lower_limit, higher_limit);
+  CompareRange(value, scratch, lower_limit, higher_limit);
   ble(on_in_range);
 }
 
@@ -2332,22 +2192,11 @@ void MacroAssembler::TryInlineTruncateDoubleToI(Register result,
                                                 DoubleRegister double_input,
                                                 Label* done) {
   DoubleRegister double_scratch = kScratchDoubleReg;
-#if !V8_TARGET_ARCH_PPC64
-  Register scratch = ip;
-#endif
-
   ConvertDoubleToInt64(double_input,
-#if !V8_TARGET_ARCH_PPC64
-                       scratch,
-#endif
                        result, double_scratch);
 
 // Test for overflow
-#if V8_TARGET_ARCH_PPC64
   TestIfInt32(result, r0);
-#else
-  TestIfInt32(scratch, result, r0);
-#endif
   beq(done);
 }
 
@@ -2526,11 +2375,7 @@ void MacroAssembler::CallRuntime(const Runtime::Function* f,
   // smarter.
   mov(r3, Operand(num_arguments));
   Move(r4, ExternalReference::Create(f));
-#if V8_TARGET_ARCH_PPC64
   CallBuiltin(Builtins::RuntimeCEntry(f->result_size));
-#else
-  CallBuiltin(Builtins::RuntimeCEntry(1));
-#endif
 }
 
 void MacroAssembler::TailCallRuntime(Runtime::FunctionId fid) {
@@ -2730,7 +2575,7 @@ void MacroAssembler::AssertFunction(Register object) {
     Check(ne, AbortReason::kOperandIsASmiAndNotAFunction, cr0);
     push(object);
     LoadMap(object, object);
-    CompareInstanceTypeRange(object, object, FIRST_JS_FUNCTION_TYPE,
+    CompareInstanceTypeRange(object, object, r0, FIRST_JS_FUNCTION_TYPE,
                              LAST_JS_FUNCTION_TYPE);
     pop(object);
     Check(le, AbortReason::kOperandIsNotAFunction);
@@ -2745,7 +2590,7 @@ void MacroAssembler::AssertCallableFunction(Register object) {
   Check(ne, AbortReason::kOperandIsASmiAndNotAFunction, cr0);
   push(object);
   LoadMap(object, object);
-  CompareInstanceTypeRange(object, object, FIRST_CALLABLE_JS_FUNCTION_TYPE,
+  CompareInstanceTypeRange(object, object, r0, FIRST_CALLABLE_JS_FUNCTION_TYPE,
                            LAST_CALLABLE_JS_FUNCTION_TYPE);
   pop(object);
   Check(le, AbortReason::kOperandIsNotACallableFunction);
@@ -2775,7 +2620,8 @@ void MacroAssembler::AssertGeneratorObject(Register object) {
 
   // Check if JSGeneratorObject
   Register instance_type = object;
-  CompareInstanceTypeRange(map, instance_type, FIRST_JS_GENERATOR_OBJECT_TYPE,
+  CompareInstanceTypeRange(map, instance_type, r0,
+                           FIRST_JS_GENERATOR_OBJECT_TYPE,
                            LAST_JS_GENERATOR_OBJECT_TYPE);
   // Restore generator object to register and perform assertion
   pop(object);
@@ -3066,33 +2912,20 @@ void MacroAssembler::LoadDoubleLiteral(DoubleRegister result,
   // avoid gcc strict aliasing error using union cast
   union {
     uint64_t dval;
-#if V8_TARGET_ARCH_PPC64
     intptr_t ival;
-#else
-    intptr_t ival[2];
-#endif
   } litVal;
 
   litVal.dval = value.AsUint64();
 
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mov(scratch, Operand(litVal.ival));
     mtfprd(result, scratch);
     return;
   }
-#endif
 
   addi(sp, sp, Operand(-kDoubleSize));
-#if V8_TARGET_ARCH_PPC64
   mov(scratch, Operand(litVal.ival));
   std(scratch, MemOperand(sp));
-#else
-  LoadIntLiteral(scratch, litVal.ival[0]);
-  stw(scratch, MemOperand(sp, 0));
-  LoadIntLiteral(scratch, litVal.ival[1]);
-  stw(scratch, MemOperand(sp, 4));
-#endif
   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
   lfd(result, MemOperand(sp, 0));
   addi(sp, sp, Operand(kDoubleSize));
@@ -3101,23 +2934,15 @@ void MacroAssembler::LoadDoubleLiteral(DoubleRegister result,
 void MacroAssembler::MovIntToDouble(DoubleRegister dst, Register src,
                                     Register scratch) {
 // sign-extend src to 64-bit
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mtfprwa(dst, src);
     return;
   }
-#endif
 
   DCHECK(src != scratch);
   subi(sp, sp, Operand(kDoubleSize));
-#if V8_TARGET_ARCH_PPC64
   extsw(scratch, src);
   std(scratch, MemOperand(sp, 0));
-#else
-  srawi(scratch, src, 31);
-  stw(scratch, MemOperand(sp, Register::kExponentOffset));
-  stw(src, MemOperand(sp, Register::kMantissaOffset));
-#endif
   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
   lfd(dst, MemOperand(sp, 0));
   addi(sp, sp, Operand(kDoubleSize));
@@ -3126,53 +2951,34 @@ void MacroAssembler::MovIntToDouble(DoubleRegister dst, Register src,
 void MacroAssembler::MovUnsignedIntToDouble(DoubleRegister dst, Register src,
                                             Register scratch) {
 // zero-extend src to 64-bit
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mtfprwz(dst, src);
     return;
   }
-#endif
 
   DCHECK(src != scratch);
   subi(sp, sp, Operand(kDoubleSize));
-#if V8_TARGET_ARCH_PPC64
   clrldi(scratch, src, Operand(32));
   std(scratch, MemOperand(sp, 0));
-#else
-  li(scratch, Operand::Zero());
-  stw(scratch, MemOperand(sp, Register::kExponentOffset));
-  stw(src, MemOperand(sp, Register::kMantissaOffset));
-#endif
   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
   lfd(dst, MemOperand(sp, 0));
   addi(sp, sp, Operand(kDoubleSize));
 }
 
 void MacroAssembler::MovInt64ToDouble(DoubleRegister dst,
-#if !V8_TARGET_ARCH_PPC64
-                                      Register src_hi,
-#endif
                                       Register src) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mtfprd(dst, src);
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
-#if V8_TARGET_ARCH_PPC64
   std(src, MemOperand(sp, 0));
-#else
-  stw(src_hi, MemOperand(sp, Register::kExponentOffset));
-  stw(src, MemOperand(sp, Register::kMantissaOffset));
-#endif
   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
   lfd(dst, MemOperand(sp, 0));
   addi(sp, sp, Operand(kDoubleSize));
 }
 
-#if V8_TARGET_ARCH_PPC64
 void MacroAssembler::MovInt64ComponentsToDouble(DoubleRegister dst,
                                                 Register src_hi,
                                                 Register src_lo,
@@ -3191,18 +2997,15 @@ void MacroAssembler::MovInt64ComponentsToDouble(DoubleRegister dst,
   lfd(dst, MemOperand(sp));
   addi(sp, sp, Operand(kDoubleSize));
 }
-#endif
 
 void MacroAssembler::InsertDoubleLow(DoubleRegister dst, Register src,
                                      Register scratch) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mffprd(scratch, dst);
     rldimi(scratch, src, 0, 32);
     mtfprd(dst, scratch);
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
   stfd(dst, MemOperand(sp));
@@ -3214,14 +3017,12 @@ void MacroAssembler::InsertDoubleLow(DoubleRegister dst, Register src,
 
 void MacroAssembler::InsertDoubleHigh(DoubleRegister dst, Register src,
                                       Register scratch) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mffprd(scratch, dst);
     rldimi(scratch, src, 32, 0);
     mtfprd(dst, scratch);
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
   stfd(dst, MemOperand(sp));
@@ -3232,12 +3033,10 @@ void MacroAssembler::InsertDoubleHigh(DoubleRegister dst, Register src,
 }
 
 void MacroAssembler::MovDoubleLowToInt(Register dst, DoubleRegister src) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mffprwz(dst, src);
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
   stfd(src, MemOperand(sp));
@@ -3247,13 +3046,11 @@ void MacroAssembler::MovDoubleLowToInt(Register dst, DoubleRegister src) {
 }
 
 void MacroAssembler::MovDoubleHighToInt(Register dst, DoubleRegister src) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mffprd(dst, src);
     srdi(dst, dst, Operand(32));
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
   stfd(src, MemOperand(sp));
@@ -3263,26 +3060,16 @@ void MacroAssembler::MovDoubleHighToInt(Register dst, DoubleRegister src) {
 }
 
 void MacroAssembler::MovDoubleToInt64(
-#if !V8_TARGET_ARCH_PPC64
-    Register dst_hi,
-#endif
     Register dst, DoubleRegister src) {
-#if V8_TARGET_ARCH_PPC64
   if (CpuFeatures::IsSupported(PPC_8_PLUS)) {
     mffprd(dst, src);
     return;
   }
-#endif
 
   subi(sp, sp, Operand(kDoubleSize));
   stfd(src, MemOperand(sp));
   nop(GROUP_ENDING_NOP);  // LHS/RAW optimization
-#if V8_TARGET_ARCH_PPC64
   ld(dst, MemOperand(sp, 0));
-#else
-  lwz(dst_hi, MemOperand(sp, Register::kExponentOffset));
-  lwz(dst, MemOperand(sp, Register::kMantissaOffset));
-#endif
   addi(sp, sp, Operand(kDoubleSize));
 }
 
@@ -5928,4 +5715,4 @@ void CallApiFunctionAndReturn(MacroAssembler* masm, bool with_profiling,
 
 #undef __
 
-#endif  // V8_TARGET_ARCH_PPC || V8_TARGET_ARCH_PPC64
+#endif  // V8_TARGET_ARCH_PPC64

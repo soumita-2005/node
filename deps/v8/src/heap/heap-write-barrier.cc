@@ -14,6 +14,7 @@
 #include "src/objects/js-objects.h"
 #include "src/objects/maybe-object.h"
 #include "src/objects/slots-inl.h"
+#include "src/sandbox/js-dispatch-table-inl.h"
 
 namespace v8 {
 namespace internal {
@@ -123,6 +124,26 @@ void WriteBarrier::MarkingSlow(Tagged<TrustedObject> host,
                                Tagged<TrustedObject> value) {
   MarkingBarrier* marking_barrier = CurrentMarkingBarrier(host);
   marking_barrier->Write(host, slot, value);
+}
+
+void WriteBarrier::MarkingSlow(Tagged<HeapObject> host,
+                               JSDispatchHandle handle) {
+#ifdef V8_ENABLE_LEAPTIERING
+  GetProcessWideJSDispatchTable()->Mark(handle);
+
+  // We don't need to record a slot here because the entries in the
+  // JSDispatchTable are not compacted and because the pointers stored in the
+  // table entries are updated after compacting GC.
+  static_assert(!JSDispatchTable::kSupportsCompaction);
+
+  MarkingBarrier* marking_barrier = CurrentMarkingBarrier(host);
+  if (GetProcessWideJSDispatchTable()->HasCode(handle)) {
+    Tagged<Code> value = GetProcessWideJSDispatchTable()->GetCode(handle);
+    marking_barrier->MarkValue(host, value);
+  }
+#else
+  UNREACHABLE();
+#endif
 }
 
 int WriteBarrier::MarkingFromCode(Address raw_host, Address raw_slot) {

@@ -322,6 +322,20 @@ void HeapObject::Relaxed_WriteField(size_t offset, T value) {
       static_cast<AtomicT>(value));
 }
 
+template <class T,
+          typename std::enable_if<(std::is_arithmetic<T>::value ||
+                                   std::is_enum<T>::value) &&
+                                      !std::is_floating_point<T>::value,
+                                  int>::type>
+T HeapObject::Acquire_ReadField(size_t offset) const {
+  // Pointer compression causes types larger than kTaggedSize to be
+  // unaligned. Atomic loads must be aligned.
+  DCHECK_IMPLIES(COMPRESS_POINTERS_BOOL, sizeof(T) <= kTaggedSize);
+  using AtomicT = typename base::AtomicTypeFromByteWidth<sizeof(T)>::type;
+  return static_cast<T>(base::AsAtomicImpl<AtomicT>::Acquire_Load(
+      reinterpret_cast<AtomicT*>(field_address(offset))));
+}
+
 // static
 template <typename CompareAndSwapImpl>
 Tagged<Object> HeapObject::SeqCst_CompareAndSwapField(
@@ -980,43 +994,50 @@ void HeapObject::InitSelfIndirectPointerField(size_t offset,
 }
 
 template <IndirectPointerTag tag>
-Tagged<Object> HeapObject::ReadIndirectPointerField(
+Tagged<ExposedTrustedObject> HeapObject::ReadTrustedPointerField(
     size_t offset, IsolateForSandbox isolate) const {
-  return i::ReadIndirectPointerField<tag>(field_address(offset), isolate);
-}
-
-template <IndirectPointerTag tag>
-void HeapObject::WriteIndirectPointerField(size_t offset,
-                                           Tagged<ExposedTrustedObject> value) {
-  return i::WriteIndirectPointerField<tag>(field_address(offset), value);
+  // Currently, trusted pointer loads always use acquire semantics as the
+  // under-the-hood indirect pointer loads use acquire loads anyway.
+  return ReadTrustedPointerField<tag>(offset, isolate, kAcquireLoad);
 }
 
 template <IndirectPointerTag tag>
 Tagged<ExposedTrustedObject> HeapObject::ReadTrustedPointerField(
-    size_t offset, IsolateForSandbox isolate) const {
-#ifdef V8_ENABLE_SANDBOX
-  Tagged<Object> object = ReadIndirectPointerField<tag>(offset, isolate);
+    size_t offset, IsolateForSandbox isolate,
+    AcquireLoadTag acquire_load) const {
+  Tagged<Object> object =
+      ReadMaybeEmptyTrustedPointerField<tag>(offset, isolate, acquire_load);
   DCHECK(IsExposedTrustedObject(object));
   return Cast<ExposedTrustedObject>(object);
+}
+
+template <IndirectPointerTag tag>
+Tagged<Object> HeapObject::ReadMaybeEmptyTrustedPointerField(
+    size_t offset, IsolateForSandbox isolate,
+    AcquireLoadTag acquire_load) const {
+#ifdef V8_ENABLE_SANDBOX
+  return i::ReadIndirectPointerField<tag>(field_address(offset), isolate,
+                                          acquire_load);
 #else
-  PtrComprCageBase cage_base = GetPtrComprCageBase(*this);
-  return TaggedField<ExposedTrustedObject>::Acquire_Load(
-      cage_base, *this, static_cast<int>(offset));
+  return TaggedField<Object>::Acquire_Load(*this, static_cast<int>(offset));
 #endif
 }
 
 template <IndirectPointerTag tag>
 void HeapObject::WriteTrustedPointerField(size_t offset,
                                           Tagged<ExposedTrustedObject> value) {
+  // Currently, trusted pointer stores always use release semantics as the
+  // under-the-hood indirect pointer stores use release stores anyway.
 #ifdef V8_ENABLE_SANDBOX
-  WriteIndirectPointerField<tag>(offset, value);
+  i::WriteIndirectPointerField<tag>(field_address(offset), value,
+                                    kReleaseStore);
 #else
   TaggedField<ExposedTrustedObject>::Release_Store(
       *this, static_cast<int>(offset), value);
 #endif
 }
 
-bool HeapObject::IsTrustedPointerFieldCleared(size_t offset) const {
+bool HeapObject::IsTrustedPointerFieldEmpty(size_t offset) const {
 #ifdef V8_ENABLE_SANDBOX
   IndirectPointerHandle handle = ACQUIRE_READ_UINT32_FIELD(*this, offset);
   return handle == kNullIndirectPointerHandle;
@@ -1035,6 +1056,10 @@ void HeapObject::ClearTrustedPointerField(size_t offset) {
 #endif
 }
 
+void HeapObject::ClearTrustedPointerField(size_t offset, ReleaseStoreTag) {
+  return ClearTrustedPointerField(offset);
+}
+
 Tagged<Code> HeapObject::ReadCodePointerField(size_t offset,
                                               IsolateForSandbox isolate) const {
   return Cast<Code>(
@@ -1045,8 +1070,8 @@ void HeapObject::WriteCodePointerField(size_t offset, Tagged<Code> value) {
   WriteTrustedPointerField<kCodeIndirectPointerTag>(offset, value);
 }
 
-bool HeapObject::IsCodePointerFieldCleared(size_t offset) const {
-  return IsTrustedPointerFieldCleared(offset);
+bool HeapObject::IsCodePointerFieldEmpty(size_t offset) const {
+  return IsTrustedPointerFieldEmpty(offset);
 }
 
 void HeapObject::ClearCodePointerField(size_t offset) {
@@ -1068,11 +1093,33 @@ void HeapObject::InitJSDispatchHandleField(size_t offset,
                                            IsolateForSandbox isolate,
                                            uint16_t parameter_count) {
 #ifdef V8_ENABLE_LEAPTIERING
+  JSDispatchTable* jdt = GetProcessWideJSDispatchTable();
   JSDispatchTable::Space* space =
       isolate.GetJSDispatchTableSpaceFor(field_address(offset));
   JSDispatchHandle handle =
-      GetProcessWideJSDispatchTable()->AllocateAndInitializeEntry(
-          space, parameter_count);
+      jdt->AllocateAndInitializeEntry(space, parameter_count);
+
+  // Use a Release_Store to ensure that the store of the pointer into the table
+  // is not reordered after the store of the handle. Otherwise, other threads
+  // may access an uninitialized table entry and crash.
+  auto location = reinterpret_cast<JSDispatchHandle*>(field_address(offset));
+  base::AsAtomic32::Release_Store(location, handle);
+#else
+  UNREACHABLE();
+#endif  // V8_ENABLE_LEAPTIERING
+}
+
+void HeapObject::InitJSDispatchHandleField(size_t offset,
+                                           IsolateForSandbox isolate,
+                                           uint16_t parameter_count,
+                                           Tagged<Code> code,
+                                           Address entrypoint) {
+#ifdef V8_ENABLE_LEAPTIERING
+  JSDispatchTable* jdt = GetProcessWideJSDispatchTable();
+  JSDispatchTable::Space* space =
+      isolate.GetJSDispatchTableSpaceFor(field_address(offset));
+  JSDispatchHandle handle =
+      jdt->AllocateAndInitializeEntry(space, parameter_count, code, entrypoint);
 
   // Use a Release_Store to ensure that the store of the pointer into the table
   // is not reordered after the store of the handle. Otherwise, other threads
